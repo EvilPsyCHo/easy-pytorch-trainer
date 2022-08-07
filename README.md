@@ -5,13 +5,13 @@ Easy for use and modified,  pure pytorch.  My deeplearning default trainer.
 ## features
 
 - Multiple GPUs
-- Log loss/metric/learning_rate when training
-- Auto save when valid score improved
+- Grad Norm
 
 ## Examples
 
 ```python
 train_config = TrainerConfig(
+    save_path="./model.bin"
     gpu_ids=[0, 1],
     device=0,
     batch_size=128,
@@ -19,7 +19,7 @@ train_config = TrainerConfig(
 )
 
 trainer = Trainer(train_config, model, optimizer, lr_sheduler, trn_ds, val_ds, metric_function)
-trainer.train()
+trainer.fit()
 ```
 
 ## Next

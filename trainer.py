@@ -1,9 +1,10 @@
+import gc
 from pathlib import Path
-from tqdm import tqdm
-import numpy as np
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 class AverageMeter(object):
@@ -24,9 +25,9 @@ class AverageMeter(object):
         self.sum = 0
         self.count = 0
         if self.larger_is_better:
-            self.best = -np.float('inf')
+            self.best = -np.inf
         else:
-            self.best = np.float('inf')
+            self.best = np.inf
 
     def update(self, val, n=1):
         self.val = val
@@ -43,25 +44,38 @@ class AverageMeter(object):
             return False
 
 
+def to_device(d, device):
+    if isinstance(d, dict):
+        return {k: to_device(v, device) for k, v in d.items()}
+    elif isinstance(d, torch.Tensor):
+        return d.to(device)
+    elif isinstance(d, list):
+        return [to_device(i, device) for i in d]
+    else:
+        raise ValueError
+
+
 class TrainerConfig:
     max_epochs = 8
     batch_size = 32
-    grad_norm_clip = 1.0
-    ckpt_path = "model.bin"
+    grad_norm_clip = None
+    # Data Loader
     num_workers = 8
-    collate_fn=None
-    device="cuda:0"
-    gpu_ids=None
+    collate_fn = None
+    # Device
+    device = "cuda:0"
+    gpu_ids = None
 
-    def __init__(self, **kwargs):
-        for k,v in kwargs.items():
+    def __init__(self, save_path, **kwargs):
+        self.save_path = save_path
+        for k, v in kwargs.items():
             setattr(self, k, v)
 
 
 class Trainer:
 
-    def __init__(self, train_config, model, optimizer, lr_scheduler, train_dataset,
-                 test_dataset, metric_fn, metric_larger_better=True, collate_fn=None):
+    def __init__(self, train_config, model, optimizer, train_dataset,
+                 test_dataset=None, metric_fn=None, metric_larger_better=True, lr_scheduler=None, collate_fn=None):
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -69,79 +83,97 @@ class Trainer:
         self.test_dataset = test_dataset
         self.config = train_config
         self.metric_fn = metric_fn
-        self.metric_name = metric_fn.__name__
         self.metric_larger_better = metric_larger_better
         self.collate_fn = collate_fn
         # take over whatever gpus are on the system
         self.device = self.config.device
         if self.config.gpu_ids is not None:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.config.gpu_ids).to(self.device)
+        else:
+            self.model.to(self.device)
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, oof=None):
         # DataParallel wrappers keep raw model object in .module attribute
-        Path(self.config.ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.config.save_path).parent.mkdir(parents=True, exist_ok=True)
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        print(f"saving {self.config.ckpt_path}")
-        torch.save(raw_model.state_dict(), self.config.ckpt_path)
+        save_path = self.config.save_path
+        print(f"saved in {save_path}")
+        torch.save({'checkpoint': raw_model.state_dict(), 'oof': oof}, save_path)
 
     @torch.no_grad()
     def valid_epoch(self, loader):
         model, config = self.model, self.config
         model.eval()
-        scores = AverageMeter(self.metric_larger_better)
         losses = AverageMeter()
         pbar = enumerate(loader)
-
+        score = None
+        preds, labels = [], []
         for it, (x, y) in pbar:
-            for k in x.keys():
-                x[k] = x[k].to(self.device)
-
+            x = to_device(x, self.device)
+            y = to_device(y, self.device)
             # forward the model
-            logit, loss = model(x, label=y.to(self.device))
+            logit, loss = model(**x, label=y)
             loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
             losses.update(loss.item())
-            scores.update(self.metric_fn(y, logit.cpu().numpy()))
-        return losses.avg, scores.avg
+            preds.append(logit.cpu().numpy())
+            labels.append(y.cpu().numpy())
+            del x; del y; gc.collect()
+        preds = np.concatenate(preds, axis=0)
+        labels = np.concatenate(labels, axis=0)
+        if self.metric_fn is not None:
+            score = self.metric_fn(labels, preds)
+        return losses.avg, preds, score
 
     def train_epoch(self, loader, num_epoch):
         model, optimizer, lr_scheduler, config = self.model, self.optimizer, self.lr_scheduler, self.config
         model.train()
-        scores = AverageMeter(self.metric_larger_better)
+        score = None
         losses = AverageMeter()
         pbar = tqdm(enumerate(loader), total=len(loader))
+        preds = []
+        labels = []
+
         for it, (x, y) in pbar:
             # place data on the correct device
-            for k in x.keys():
-                x[k] = x[k].to(self.device)
+            x = to_device(x, self.device)
+            y = to_device(y, self.device)
 
             # forward the model
-            logit, loss = model(x, label=y.to(self.device))
+            logit, loss = model(**x, label=y)
             loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
 
             # backprop and update the parameters
             model.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+            if self.config.grad_norm_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
             optimizer.step()
 
             # record
             loss = loss.item()
             losses.update(loss)
-            score = self.metric_fn(y, logit.detach().cpu().numpy())
-            scores.update(score)
+
+            preds.append(logit.detach().cpu().numpy())
+            labels.append(y.cpu().numpy())
 
             # decay the learning rate based on our progress
-            lr_scheduler.step(num_epoch+it/len(loader))
+            if lr_scheduler is not None:
+                lr_scheduler.step(num_epoch+it/len(loader))
             lr = []
             for param_group in optimizer.param_groups:
                 lr.append(param_group['lr'])
             lr = np.mean(lr)
 
             # report progress
-            pbar.set_description(f"train loss {loss:.4f}, {self.metric_name} {score:.4f}, lr {lr:.6f}")
-        return losses.avg, scores.avg
+            pbar.set_description(f"train loss {loss:.4f} lr {lr:.6f}")
 
-    def train(self):
+        labels = np.concatenate(labels, axis=0)
+        preds = np.concatenate(preds, axis=0)
+        if self.metric_fn is not None:
+            score = self.metric_fn(labels, preds)
+        return losses.avg, score
+
+    def fit(self):
         config = self.config
         scores = AverageMeter(self.metric_larger_better)
 
@@ -153,26 +185,34 @@ class Trainer:
             num_workers=config.num_workers,
             collate_fn=self.collate_fn
         )
-        test_loader = DataLoader(
-            self.test_dataset,
-            shuffle=True,
-            pin_memory=True,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            collate_fn=self.collate_fn
-        )
+
+        if self.test_dataset is not None:
+            test_loader = DataLoader(
+                self.test_dataset,
+                shuffle=True,
+                pin_memory=True,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                collate_fn=self.collate_fn
+            )
 
         for epoch in range(config.max_epochs):
             trn_loss, trn_score = self.train_epoch(train_loader, epoch)
-            val_loss, val_score = self.valid_epoch(test_loader)
-            print(f"Epoch {epoch + 1} "
-                  f"train loss {trn_loss:.4f} {self.metric_name} {trn_score:.4f}, "
-                  f"val loss {val_loss:.4f} {self.metric_name} {val_score: .4f}")
-            # supports early stopping based on the test loss, or just save always if no test set is provided
-            good_model = scores.update(val_score)
-            if self.config.ckpt_path is not None and good_model:
+            info = f"Epoch {epoch + 1} train loss {trn_loss:.4f}"
+            if self.metric_fn is not None:
+                info += f" score {trn_score:.4f}"
+            if self.test_dataset is not None:
+                val_loss, val_preds, val_score = self.valid_epoch(test_loader)
+                info += f" val loss {val_loss:.4f}"
+                if self.metric_fn is not None:
+                    info += f" score {val_score: .4f}"
+                good_model = scores.update(val_score)
+                if good_model:
+                    self.save_checkpoint(val_preds)
+            else:
                 self.save_checkpoint()
-        return scores.best
+            print(info)
+            # supports early stopping based on the test loss, or just save always if no test set is provided
 
     @torch.no_grad()
     def predict(self, dataset):
@@ -187,9 +227,8 @@ class Trainer:
         )
         preds = []
         for x in loader:
-            for k in x.keys():
-                x[k] = x[k].to(self.device)
-            logit = self.model(x)
+            to_device(x, self.device)
+            logit = self.model(**x)
             preds.append(logit.cpu().numpy())
         preds = np.concatenate(preds, axis=0)
         return preds
